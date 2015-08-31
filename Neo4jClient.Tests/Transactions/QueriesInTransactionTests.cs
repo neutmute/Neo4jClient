@@ -9,6 +9,7 @@ using System.Transactions;
 using Neo4jClient.ApiModels.Cypher;
 using Neo4jClient.Cypher;
 using Neo4jClient.Transactions;
+using Newtonsoft.Json.Serialization;
 using NUnit.Framework;
 using TransactionScopeOption = System.Transactions.TransactionScopeOption;
 
@@ -609,6 +610,47 @@ namespace Neo4jClient.Test.Transactions
         }
 
         [Test]
+        public void TestTransactionScopeWithComplexDeserialization()
+        {
+            const string queryText = @"MATCH (dt:DummyTotal) RETURN dt";
+            const string resultColumn = @"{'columns':['dt'],'data':[{'row':[{'total':1234}]}]}";
+            var cypherQuery = new CypherQuery(queryText, new Dictionary<string, object>(), CypherResultMode.Projection);
+            var cypherApiQuery = new CypherStatementList { new CypherTransactionStatement(cypherQuery, false) };
+            var commitRequest = MockRequest.PostJson("/transaction/1/commit", @"{'statements': []}");
+
+            using (var testHarness = new RestTestHarness
+            {
+                {
+                    MockRequest.PostObjectAsJson("/transaction", cypherApiQuery),
+                    MockResponse.Json(201, GenerateInitTransactionResponse(1, resultColumn), "http://foo/db/data/transaction/1")
+                },
+                {
+                    commitRequest, MockResponse.Json(200, @"{'results':[], 'errors':[] }")
+                }
+            })
+            {
+                var client = testHarness.CreateAndConnectTransactionalGraphClient();
+                client.JsonContractResolver = new CamelCasePropertyNamesContractResolver();
+                using (var msTransaction = new TransactionScope())
+                {
+                    Assert.IsTrue(client.InTransaction);
+
+                    var results = client.Cypher.Match("(dt:DummyTotal)")
+                        .Return(dt => dt.As<DummyTotal>())
+                        .Results
+                        .ToList();
+
+                    Assert.AreEqual(1, results.Count());
+                    Assert.AreEqual(1234, results.First().Total);
+
+                    msTransaction.Complete();
+                }
+
+                Assert.IsFalse(client.InTransaction);
+            }
+        }
+
+        [Test]
         public void TransactionCommitInTransactionScope()
         {
             var initTransactionRequest = MockRequest.PostJson("/transaction", @"{
@@ -920,9 +962,14 @@ namespace Neo4jClient.Test.Transactions
             }
         }
 
-        
+        /// <summary>
+        /// This test is flakey. If run in Resharper as a group, it fails. If run by itself it passes.
+        /// Appears to be a race condition where for the test to pass the ExecuteGetCypherResultsAsync() call needs to still be in progress before the Commit() is called.
+        /// If stepped through, the test will fail since the call easily finishes. Flakeyness observable as early as [bdc1c45]
+        /// Perhaps need to insert simulated delay into MockResponse?
+        /// </summary>
         [Test]
-        [ExpectedException(typeof(InvalidOperationException))]
+        [ExpectedException(typeof(InvalidOperationException), ExpectedMessage = "Cannot commit unless all tasks have been completed")]
         public void CommitFailsOnPendingAsyncRequests()
         {
             const string queryText = @"MATCH (n) RETURN count(n) as Total";
@@ -948,8 +995,6 @@ namespace Neo4jClient.Test.Transactions
                 }
 
             }
-
-            Assert.Fail("Commit did not fail with pending tasks");
         }
     }
 }
